@@ -1,0 +1,120 @@
+# Recipe: MiniMax-M3-W4A16-GPTQ + KVarN k4v2 KV EVERYWHERE (production)
+# ==============================================================================
+# The all-Triton stack: stock vLLM kernels + the KVarN KV-cache quantization
+# backport (PR #46812; calibration-free 4-bit-K / 2-bit-V per 128-token tile:
+# Hadamard rotation + Sinkhorn normalization + asymmetric RTN, fp16 sink/tail
+# pool), extended by this repo's mods to cover the ENTIRE MiniMax-M3 layout:
+#   * 57 sparse MSA layers  — KVarN tiles, fused in-kernel dequant for decode
+#     AND prefill (both Hadamard rotations folded in-kernel; no workspace)
+#   * indexer index-K cache — 4-bit KVarN tiles (70 B/token vs bf16 256)
+#   * 3 dense layers        — KVarN dense backend
+#   * bounded FA materialize scratch + LSE-merge KV-windowed path for >32k
+#     contexts (fix-kvarn-dense-fa-scratch-cap)
+#
+# Main sparse KV: 108 B/token/head vs bf16 512 — ~4.7x sparse-KV capacity.
+#
+# VALIDATED on 2x GB10 (DGX Spark, 121 GiB unified) @ TP2, 2026-07-04:
+#   KV pool 243k-314k tokens depending on boot page-cache state (measured
+#   314,496 on a clean boot at the 65k-ctx config = 4.80x concurrency)
+#   decode 23.1 t/s @512 / 21.4 t/s @65k ctx
+#   chunked FA path (>32k ctx): needle @67k EXACT (validated in serving)
+#   (full narrative: runs/baselines/SUMMARY.md)
+#
+# For ~1.5-1.9x faster decode at reduced KV capacity, the EAGLE3 variant of
+# this stack lives in git history (minimax-m3-w4a16-gptq-kvarn-eagle3.yaml,
+# removed when this recipe went drafterless: 170,752-token pool,
+# 39.7/30.4/26.4 t/s @512/65k/120k). The b12x recipes carry EAGLE3.
+
+recipe_version: "1"
+name: MiniMax-M3-W4A16-GPTQ-kvarn
+description: MiniMax-M3 GPTQ W4A16 TP2, KVarN k4v2 KV on all 60 layers + indexer; stock Triton kernels, 131k context, no drafter
+
+model: Sebesky/MiniMax-M3-W4A16-GPTQ
+container: vllm-node-minimax-m3-b12x
+
+build_args:
+  - --vllm-ref
+  - 979b56a66c969ab67655d2155ab4c6c5bed15f65
+  - --apply-vllm-patch
+  - minimax-m3-fused-fp8-kv.patch
+  - --build-rust
+
+cluster_only: true
+mods:
+  # Stock (non-b12x) M3 stack + KVarN. kvarn-sparse REPLACES kvarn-hybrid
+  # (do not combine). See docs/b12x-kvarn-integration-plan.md.
+  - mods/fix-prometheus-fastapi-routing
+  - mods/fix-minimax-m3-reasoning-parser-robustness
+  - mods/fix-minimax-m3-compressed-tensors-swiglu-clamp
+  - mods/fix-minimax-m3-indexer-proj-bf16-load
+  - mods/add-kvarn-kv-quant
+  - mods/fix-minimax-m3-kvarn-sparse
+  - mods/fix-minimax-m3-kvarn-indexer
+  # bound dense-kvarn FA scratch; >cap contexts take the chunked path
+  - mods/fix-kvarn-dense-fa-scratch-cap
+  # profiling-time cudagraph capture double-charges non-torch memory
+  - mods/fix-cudagraph-mem-profile-double-charge
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  # 0.93: the startup free-memory check runs AFTER APIServer+EngineCore spin
+  # up on the head node -- anything above 0.93 is knife-edge there.
+  # NEVER use num_gpu_blocks_override past profiler-available on GB10:
+  # unified memory has no clean cudaMalloc failure -- overcommit evicts the
+  # file-backed model weights and wedges the whole box.
+  gpu_memory_utilization: 0.93
+  # 131072 leaves ~1.9-2.4x concurrency headroom (needs 2.49 GiB/rank KV vs
+  # 3.8-5.2 measured available). Accounting says ~196k-224k fits without the
+  # drafter (runs/baselines/SUMMARY.md), but that regime is boot-sensitive
+  # and NOT serving-validated -- raise at your own risk; failures are clean
+  # ValueErrors at startup.
+  max_model_len: 131072
+  # 2048 (vs 1024 in the EAGLE3 variant): without the drafter there is ample
+  # KV headroom, so take the faster long-prompt prefill.
+  max_num_batched_tokens: 2048
+  max_num_seqs: 1
+  block_size: 128
+  kv_cache_dtype: kvarn_k4v2_g128
+  load_format: safetensors
+
+env:
+  # KVarN fp16 tail pool (dense layers). The sparse-layer pool is sized
+  # structurally in kvarn_sparse (3*seqs + q_len_max + 2*prefill_blocks + 8).
+  KVARN_POOL_MEM_FRAC: "0.01"
+  VLLM_SKIP_CUDAGRAPH_MEM_PROFILE: "1"
+  # 32k-token FA scratch; longer contexts use the LSE-merge windowed path
+  # (serving-validated: exact 67k needle retrieval through the dense layers)
+  KVARN_FA_SCRATCH_CAP_TOKENS: "32768"
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  VLLM_MARLIN_USE_ATOMIC_ADD: "1"
+  OMP_NUM_THREADS: "20"
+  MKL_NUM_THREADS: "20"
+  OPENBLAS_NUM_THREADS: "20"
+  NUMEXPR_NUM_THREADS: "20"
+  VLLM_USE_BREAKABLE_CUDAGRAPH: "0"
+  VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "0"
+  HF_TOKEN: $HF_TOKEN
+
+command: |
+  vllm serve Sebesky/MiniMax-M3-W4A16-GPTQ \
+      --trust-remote-code \
+      --port {port} \
+      --host {host} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      -tp {tensor_parallel} \
+      --distributed-executor-backend mp \
+      --block-size {block_size} \
+      --kv-cache-dtype {kv_cache_dtype} \
+      --attention-config '{{"indexer_kv_dtype": "kvarn"}}' \
+      --compilation-config '{{"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_copy_inputs": true}}' \
+      --default-chat-template-kwargs '{{"thinking_mode":"adaptive"}}' \
+      --max-model-len {max_model_len} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --max-num-seqs {max_num_seqs} \
+      --language-model-only \
+      --load-format {load_format} \
+      --reasoning-parser minimax_m3 \
+      --enable-auto-tool-choice \
+      --tool-call-parser minimax_m3

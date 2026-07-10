@@ -1,0 +1,26 @@
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -110,6 +110,7 @@
+         cd flashinfer && \
+         git fetch origin && \
+         git fetch origin --tags --force && \
++        (git fetch origin ${VLLM_REF} || git fetch origin refs/pull/45381/head || true) && \
+         (git checkout --detach origin/${FLASHINFER_REF} 2>/dev/null || git checkout ${FLASHINFER_REF}) && \
+         git submodule update --init --recursive && \
+         git clean -fdx && \
+@@ -190,6 +191,7 @@
+         git clone --recursive https://github.com/vllm-project/vllm.git; \
+         if [ "$VLLM_REF" != "main" ]; then \
+             cd vllm && \
++            (git fetch origin ${VLLM_REF} || git fetch origin refs/pull/45381/head || true) && \
+             git checkout ${VLLM_REF}; \
+         fi; \
+     else \
+@@ -197,6 +199,7 @@
+         cd vllm && \
+         git fetch origin && \
+         git fetch origin --tags --force && \
++        (git fetch origin ${VLLM_REF} || git fetch origin refs/pull/45381/head || true) && \
+         (git checkout --detach origin/${VLLM_REF} 2>/dev/null || git checkout ${VLLM_REF}) && \
+         git submodule update --init --recursive && \
+         git clean -fdx && \
